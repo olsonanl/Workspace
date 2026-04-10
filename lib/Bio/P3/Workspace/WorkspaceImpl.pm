@@ -30,7 +30,7 @@ use JSON::XS;
 use Data::Dumper;
 use HTTP::Request::Common;
 use Log::Log4perl qw(:easy);
-use MongoDB::Connection;
+use MongoDB;
 use URI::Escape;
 use AnyEvent;
 use AnyEvent::HTTP;
@@ -2154,31 +2154,67 @@ sub new
 	}
         close($fh);
         my $timeout = 120_000;
-	my $config = {
-		host => $params->{"mongodb-host"},
-		db_name => $params->{"mongodb-database"},
+	#
+	# Build MongoDB connection using MongoClient with replica set support.
+	# For replica sets, find_master must be enabled to discover the primary,
+	# and read_preference is set to PRIMARY_PREFERRED to allow reads from
+	# secondaries when the primary is unavailable.
+	#
+	my $mongo_host = $params->{"mongodb-host"};
+	my $mongo_db = $params->{"mongodb-database"};
+
+	# Build connection URI if not already in URI format
+	# Support both simple host and mongodb:// URI format
+	my $uri;
+	if ($mongo_host =~ /^mongodb(\+srv)?:\/\//) {
+		# Already a URI, use as-is
+		$uri = $mongo_host;
+	} else {
+		# Build URI from host(s)
+		# Handle comma-separated hosts for replica sets (e.g., "host1:27017,host2:27017,host3:27017")
+		$uri = "mongodb://$mongo_host";
+	}
+
+	# Client options for replica set failover support
+	my $client_options = {
+		host => $uri,
+		db_name => $mongo_db,
+		# find_master enables replica set discovery - required for failover
+		find_master => 1,
 		auto_connect => 1,
 		auto_reconnect => 1,
-	        timeout => $timeout,
-		query_timeout => $timeout
+		timeout => $timeout,
+		query_timeout => $timeout,
 	};
+
+	# Add authentication if configured
+	if (defined $params->{"mongodb-user"} && $params->{"mongodb-user"} ne 'null' &&
+	    defined $params->{"mongodb-pwd"} && $params->{"mongodb-pwd"} ne 'null') {
+		$client_options->{username} = $params->{"mongodb-user"};
+		$client_options->{password} = $params->{"mongodb-pwd"};
+	}
+
 	if (defined($params->{adminlist})) {
 		my $array = [split(/;/,$params->{adminlist})];
 		for (my $i=0; $i < @{$array}; $i++) {
 			$self->{_admins}->{$array->[$i]} = 1;
 		}
-		$self->{_admins}->{$params->{wsuser}} = 1;	
+		$self->{_admins}->{$params->{wsuser}} = 1;
 	}
-	if(defined $params->{"mongodb-user"} && defined $params->{"mongodb-pwd"}) {
-		$config->{username} = $params->{"mongodb-user"};
-		$config->{password} = $params->{"mongodb-pwd"};
-	}
-	my $conn = MongoDB::Connection->new(%$config);
-        $self->{_mongodb_config} = $config;
-	if (!defined($conn)) {
+
+	my $client = MongoDB::MongoClient->new(%$client_options);
+	$self->{_mongodb_config} = $client_options;
+	if (!defined($client)) {
 		$self->_error("Unable to connect to mongodb database!");
 	}
-	$self->{_mongodb} = $conn->get_database($params->{"mongodb-database"});
+
+	# Set read preference to PRIMARY_PREFERRED for replica set failover.
+	# This allows reads from secondaries when the primary is down,
+	# which fixes "not master and slaveOK=false" errors during failover.
+	$client->read_preference(MongoDB::MongoClient->PRIMARY_PREFERRED);
+
+	$self->{_mongodb} = $client->get_database($mongo_db);
+	$self->{_mongoclient} = $client;
 	$self->{_params} = $params;
 	$self->{_params}->{"db-path"} =~ s/\/\//\//g;
 	$self->{_params}->{"db-path"} =~ s/\/$//g;
