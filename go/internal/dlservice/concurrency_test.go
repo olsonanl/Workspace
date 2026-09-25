@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BV-BRC/Workspace/go/internal/dlstore"
+	"github.com/BV-BRC/Workspace/go/internal/wsresolve"
 )
 
 // slowStore simulates the pathological Mongo latency that cripples the Perl
@@ -39,6 +40,15 @@ func (s *slowStore) FindSession(context.Context, string) (*dlstore.AuthCookie, e
 	return nil, dlstore.ErrNotFound
 }
 func (s *slowStore) InsertSession(context.Context, *dlstore.AuthCookie) error { return nil }
+func (s *slowStore) FindWorkspace(context.Context, string, string) (*wsresolve.Workspace, error) {
+	return nil, dlstore.ErrNotFound
+}
+func (s *slowStore) FindWorkspaceByUUID(context.Context, string) (*wsresolve.Workspace, error) {
+	return nil, dlstore.ErrNotFound
+}
+func (s *slowStore) FindObject(context.Context, string, string, string) (*dlstore.Object, error) {
+	return nil, dlstore.ErrNotFound
+}
 
 // TestConcurrentRequestsDoNotSerialize is the regression test for the bug this
 // port exists to fix. With a 300ms store delay, 40 concurrent downloads must

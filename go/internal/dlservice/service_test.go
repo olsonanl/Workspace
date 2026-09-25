@@ -13,14 +13,50 @@ import (
 	"time"
 
 	"github.com/BV-BRC/Workspace/go/internal/dlstore"
+	"github.com/BV-BRC/Workspace/go/internal/wsresolve"
 )
 
 // fakeStore stands in for Mongo.
 type fakeStore struct {
-	byKey     map[string]*dlstore.Download
-	bySig     map[string]*dlstore.Download
-	sessions  map[string]*dlstore.AuthCookie
-	forcedErr error
+	byKey      map[string]*dlstore.Download
+	bySig      map[string]*dlstore.Download
+	sessions   map[string]*dlstore.AuthCookie
+	workspaces map[string]*wsresolve.Workspace // key: "owner/name"
+	byUUID     map[string]*wsresolve.Workspace // key: workspace uuid
+	objects    map[string]*dlstore.Object      // key: "workspaceUUID|path|name"
+	forcedErr  error
+
+	insertedSessions []*dlstore.AuthCookie // recorded by InsertSession, for /set-cookie-auth tests
+}
+
+func (f *fakeStore) FindWorkspace(_ context.Context, owner, name string) (*wsresolve.Workspace, error) {
+	if f.forcedErr != nil {
+		return nil, f.forcedErr
+	}
+	if w, ok := f.workspaces[owner+"/"+name]; ok {
+		return w, nil
+	}
+	return nil, dlstore.ErrNotFound
+}
+
+func (f *fakeStore) FindWorkspaceByUUID(_ context.Context, uuid string) (*wsresolve.Workspace, error) {
+	if f.forcedErr != nil {
+		return nil, f.forcedErr
+	}
+	if w, ok := f.byUUID[uuid]; ok {
+		return w, nil
+	}
+	return nil, dlstore.ErrNotFound
+}
+
+func (f *fakeStore) FindObject(_ context.Context, workspaceUUID, path, name string) (*dlstore.Object, error) {
+	if f.forcedErr != nil {
+		return nil, f.forcedErr
+	}
+	if o, ok := f.objects[workspaceUUID+"|"+path+"|"+name]; ok {
+		return o, nil
+	}
+	return nil, dlstore.ErrNotFound
 }
 
 func (f *fakeStore) FindByDownloadKey(_ context.Context, k string) (*dlstore.Download, error) {
@@ -53,7 +89,10 @@ func (f *fakeStore) FindSession(_ context.Context, t string) (*dlstore.AuthCooki
 	return nil, dlstore.ErrNotFound
 }
 
-func (f *fakeStore) InsertSession(context.Context, *dlstore.AuthCookie) error { return nil }
+func (f *fakeStore) InsertSession(_ context.Context, a *dlstore.AuthCookie) error {
+	f.insertedSessions = append(f.insertedSessions, a)
+	return nil
+}
 
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -94,8 +133,11 @@ func newTestServer(t *testing.T, content string) (http.Handler, *fakeStore) {
 				FilePath:    filepath.Join(dir, "does-not-exist"),
 			},
 		},
-		bySig:    map[string]*dlstore.Download{},
-		sessions: map[string]*dlstore.AuthCookie{},
+		bySig:      map[string]*dlstore.Download{},
+		sessions:   map[string]*dlstore.AuthCookie{},
+		workspaces: map[string]*wsresolve.Workspace{},
+		byUUID:     map[string]*wsresolve.Workspace{},
+		objects:    map[string]*dlstore.Object{},
 	}
 	s := &Server{Store: fs, Log: quietLogger()}
 	return s.Handler(), fs
@@ -321,8 +363,10 @@ func TestViewSessionHandling(t *testing.T) {
 		{"unknown session", "nosuch", http.StatusServiceUnavailable},
 		{"expired session", "stale", http.StatusServiceUnavailable},
 		{`literal "0"`, "0", http.StatusServiceUnavailable},
-		// A valid session gets past auth (the resolution step is not built yet).
-		{"valid session", "live", http.StatusNotImplemented},
+		// A valid session gets past auth and into real resolution, which then
+		// 404s because newTestServer sets up no workspace fixture for
+		// u@patricbrc.org/home -- see view_test.go for the resolution cases.
+		{"valid session, unknown workspace", "live", http.StatusNotFound},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hdr := http.Header{}

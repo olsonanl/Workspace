@@ -28,6 +28,8 @@ import (
 
 	"github.com/BV-BRC/Workspace/go/internal/dlservice"
 	"github.com/BV-BRC/Workspace/go/internal/dlstore"
+	"github.com/BV-BRC/Workspace/go/internal/p3auth"
+	"github.com/BV-BRC/Workspace/go/internal/serviceauth"
 	"github.com/BV-BRC/Workspace/go/internal/wsconfig"
 )
 
@@ -126,6 +128,20 @@ func main() {
 		EnforceDownloadExpiry: *enforceExp,
 		StrictRangeErrors:     *strictRange,
 		ShockDataDir:          cfg.ShockDataDir,
+		DownloadLifetime:      cfg.DownloadLifetime,
+		DBPath:                cfg.DBPath,
+		Validator:             &p3auth.Validator{},
+	}
+
+	// WSUser/WSPassword are optional in wsconfig (Perl's own "null" ->
+	// undef convention, see wsconfig.parseINI) -- a deployment.cfg without
+	// them still starts, it just can't grant Shock read ACLs for /view; the
+	// read is then attempted without one, same as when the grant itself
+	// fails (see resolveShockSource).
+	if cfg.WSUser != "" && cfg.WSPassword != "" {
+		srv.ServiceAuth = &serviceauth.TokenSource{User: cfg.WSUser, Password: cfg.WSPassword}
+	} else {
+		log.Warn("wsuser/wspassword not configured; /view will not grant Shock read ACLs")
 	}
 
 	httpSrv := &http.Server{
