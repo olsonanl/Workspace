@@ -66,6 +66,29 @@ func TestLoadRealTestCfg(t *testing.T) {
 	}
 }
 
+func TestShockDataDirDefaultsToEmptyAndDisabled(t *testing.T) {
+	// No shock-data-path key at all: the real test.cfg above doesn't set one,
+	// mirroring every existing deploy.cfg -- absence must mean "off", not an
+	// error, since Perl has no equivalent key to have set it from.
+	cfg, err := Load(writeTemp(t, testCfg), "")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ShockDataDir != "" {
+		t.Errorf("ShockDataDir = %q, want empty by default", cfg.ShockDataDir)
+	}
+}
+
+func TestShockDataDirIsRead(t *testing.T) {
+	cfg, err := Load(writeTemp(t, "[Workspace]\ndb-path = /mnt/ws\nshock-data-path = /disks/shock/Shock/data\n"), "")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := cfg.ShockDataDir, "/disks/shock/Shock/data"; got != want {
+		t.Errorf("ShockDataDir = %q, want %q", got, want)
+	}
+}
+
 func TestDownloadLifetimeDefaults(t *testing.T) {
 	// deploy.cfg has no download-lifetime; Perl falls back to 3600.
 	cfg, err := Load(writeTemp(t, "[Workspace]\ndb-path = /mnt/ws\n"), "")

@@ -44,6 +44,15 @@ type Config struct {
 	WSPassword string
 
 	ShockURL string
+
+	// ShockDataDir, when set, is the root of Shock's own on-disk data tree
+	// (e.g. "/disks/shock/Shock/data" -- see
+	// Bio::P3::Workspace::WSFileMember, which hardcodes this path for the
+	// Perl archive builder). When set, ws-download reads Shock-backed
+	// objects directly from disk instead of through the Shock HTTP API.
+	// This key has no Perl-side equivalent; it is Go-only and absent from
+	// deploy.cfg means the feature stays off.
+	ShockDataDir string
 }
 
 // Load reads path and extracts the given section. An empty section means
@@ -71,6 +80,7 @@ func Load(path, section string) (*Config, error) {
 		WSUser:        vals["wsuser"],
 		WSPassword:    vals["wspassword"],
 		ShockURL:      vals["shock-url"],
+		ShockDataDir:  vals["shock-data-path"],
 	}
 
 	// Perl defaults these in _validateargs (WorkspaceImpl.pm:2184-2193).
