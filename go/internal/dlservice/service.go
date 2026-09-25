@@ -288,6 +288,9 @@ type byteSource interface {
 // seekerSource adapts a local, already-open *os.File to byteSource. Used for
 // both genuine local workspace files and Shock nodes resolved to a local path
 // by shockstore.OpenLocal -- once opened, the two are indistinguishable.
+//
+// seekerSource owns f and implements io.Closer so sendFile can release it
+// uniformly regardless of which backend produced it -- see the comment there.
 type seekerSource struct{ f *os.File }
 
 func (s seekerSource) openRange(_ context.Context, start, length int64) (io.ReadCloser, error) {
@@ -299,6 +302,8 @@ func (s seekerSource) openRange(_ context.Context, start, length int64) (io.Read
 	}
 	return io.NopCloser(io.LimitReader(s.f, length)), nil
 }
+
+func (s seekerSource) Close() error { return s.f.Close() }
 
 // httpShockSource adapts workspace.ShockOpenRange to byteSource.
 type httpShockSource struct {
@@ -333,15 +338,16 @@ func (s *Server) sendFile(w http.ResponseWriter, r *http.Request, rec *dlstore.D
 			writePlain(w, http.StatusNotFound, bodyInvalidPath)
 			return
 		}
-		defer fh.Close()
 
 		st, err := fh.Stat()
 		if err != nil {
+			fh.Close()
 			s.Log.Warn("could not stat workspace file", "path", rec.FilePath, "err", err)
 			writePlain(w, http.StatusNotFound, bodyInvalidPath)
 			return
 		}
 		if st.IsDir() {
+			fh.Close()
 			writePlain(w, http.StatusNotFound, bodyNotAFile)
 			return
 		}
@@ -352,6 +358,16 @@ func (s *Server) sendFile(w http.ResponseWriter, r *http.Request, rec *dlstore.D
 		// Perl finds the doc, then open(undef) fails and it 404s.
 		writePlain(w, http.StatusNotFound, bodyInvalidPath)
 		return
+	}
+
+	// Every branch above that reaches here has handed us an open resource
+	// (a local file, or a Shock file opened by shockstore.OpenLocal via
+	// resolveShockSource) wrapped in seekerSource, which implements io.Closer.
+	// httpShockSource opens nothing until streamRanged calls openRange, and
+	// that reader is closed there instead -- so this covers exactly the
+	// backends that need it, once, regardless of which one produced src.
+	if c, ok := src.(io.Closer); ok {
+		defer c.Close()
 	}
 
 	// Perl trusts the Mongo `size` field rather than stat(), and reports it in

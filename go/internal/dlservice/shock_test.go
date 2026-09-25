@@ -216,6 +216,49 @@ func TestShockDownloadUnresolvableURLFallsBackToHTTP(t *testing.T) {
 	}
 }
 
+// A direct-filesystem Shock read must close the file it opens. Regression
+// test for a leak in the original phase-2 code: seekerSource wrapped the
+// *os.File in io.NopCloser, and sendFile only ever closed the fh it opened
+// itself in the FilePath branch -- so every Shock download served off local
+// disk held its fd open until process exit.
+func TestShockDirectFilesystemDoesNotLeakFileDescriptors(t *testing.T) {
+	const body = "no leaks here"
+	root := t.TempDir()
+	writeShockFile(t, root, testShockID, body)
+
+	fs := &fakeStore{byKey: map[string]*dlstore.Download{
+		"k": {
+			DownloadKey: "k",
+			Name:        "f.bin",
+			Size:        int64(len(body)),
+			ShockNode:   shockNodeURL("https://p3.theseed.org", testShockID),
+		},
+	}}
+	s := &Server{Store: fs, Log: quietLogger(), ShockDataDir: root}
+
+	countFDs := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Skipf("cannot read /proc/self/fd on this platform: %v", err)
+		}
+		return len(entries)
+	}
+
+	before := countFDs()
+	const n = 25
+	for i := 0; i < n; i++ {
+		w := get(s.Handler(), "GET", "/download/k/f.bin", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("iteration %d: status = %d, want 200", i, w.Code)
+		}
+	}
+	after := countFDs()
+
+	if after > before {
+		t.Errorf("open fd count grew from %d to %d after %d direct-filesystem Shock downloads; want no growth", before, after, n)
+	}
+}
+
 type failingRoundTripper struct{}
 
 func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
