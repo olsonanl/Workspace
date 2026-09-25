@@ -12,7 +12,7 @@ GOFLAGS := -ldflags="-s -w"
 SERVER_BINARY := ws-download
 SERVER_PKG := ./cmd/ws-download
 SERVER_FLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
-SERVER_PKGS := ./cmd/ws-download/... ./internal/dlservice/... ./internal/dlstore/... ./internal/wsconfig/... ./internal/shockstore/... ./internal/workspace/...
+SERVER_PKGS := ./cmd/ws-download/... ./internal/dlservice/... ./internal/dlstore/... ./internal/wsconfig/... ./internal/shockstore/... ./internal/workspace/... ./internal/wsresolve/...
 
 .PHONY: all build clean linux darwin windows test deps help \
         server server-linux-amd64 server-linux-arm64 test-server slowclient
