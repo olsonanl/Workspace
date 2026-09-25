@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -11,6 +12,54 @@ import (
 
 // ShockThreshold is the size above which files are stored in Shock
 const ShockThreshold = 10 * 1024 // 10KB
+
+// ShockOpenRange opens a byte range of a Shock node for streaming, without
+// buffering it in memory.
+//
+// It is a free function rather than a *Client method because a server
+// handling many users' downloads needs a per-request token
+// (e.g. a Workspace download record's own UserToken), not the single token a
+// *Client bakes in -- reusing a shared *Client here would leak one user's
+// credentials into another's request.
+//
+// length < 0 means "from start to EOF" and omits seek/length from the URL
+// entirely, matching WorkspaceImpl.pm:1939 exactly: a plain "?download" when
+// there is no Range header, "?download&seek=B&length=LEN" when there is.
+// Accepts both 200 and 206, like ShockReadBytes below.
+//
+// The caller must close the returned ReadCloser. ctx cancellation (e.g. the
+// client disconnecting) aborts the request rather than continuing to read a
+// response nobody wants -- the Perl service's failure to do this caused a
+// 100%-CPU spin (see Workspace/go/cmd/ws-download/PORT_STATUS.md, section
+// 1.5.3), because the exception it should have raised was silently
+// swallowed by the AnyEvent event loop.
+func ShockOpenRange(ctx context.Context, hc *http.Client, shockURL, token string, start, length int64) (io.ReadCloser, error) {
+	url := shockURL + "?download"
+	if length >= 0 {
+		url = fmt.Sprintf("%s&seek=%d&length=%d", url, start, length)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "OAuth "+token)
+	}
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
+		return nil, fmt.Errorf("shock read failed: %s - %s", resp.Status, string(body))
+	}
+
+	return resp.Body, nil
+}
 
 // ShockReadBytes reads a range of bytes from a Shock URL
 func (c *Client) ShockReadBytes(shockURL string, offset, length int64) ([]byte, error) {
