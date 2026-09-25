@@ -5,9 +5,10 @@ Port of the Perl `WorkspaceDownload` service (`lib/WorkspaceDownload.psgi` +
 
 - **Branch:** `feature/go-download-service`
 - **Phase 1 commit:** `9c84eab`
-- **Status:** phase 1 of 7 complete. `/download` serves local files end to end;
-  `/view`, `/archive`, `/set-cookie-auth` and Shock-backed files return 501 with
-  their routing, session handling and error paths already in place and tested.
+- **Status:** phase 2 of 7 complete. `/download` serves both local files and
+  Shock-backed files end to end (HTTP and an optional direct-filesystem fast
+  path); `/view`, `/archive`, and `/set-cookie-auth` return 501 with their
+  routing, session handling and error paths already in place and tested.
 - **Last updated:** 2026-09-25
 
 ---
@@ -337,6 +338,9 @@ byte of a 253 MB body — 100% CPU, flat memory, self-clearing when the body ran
 out. In Go this is `context.Context`: `dlservice` must pass `r.Context()` into
 the Shock fetch so a disconnect cancels it. `ShockDownloadToWriter` has no ctx
 parameter today — **this is a phase-2 blocker, not a nicety.**
+Done in phase 2: `internal/workspace.ShockOpenRange` takes a `ctx` and uses
+`http.NewRequestWithContext`; `dlservice.streamRanged`'s `byteSource.openRange`
+threads `r.Context()` through for both the HTTP and direct-filesystem backends.
 
 **4. Per-request logging with a ttfb/total split.**
 Two hypotheses died purely because the Perl logs recorded *that* a response
@@ -355,18 +359,64 @@ only, never for authorization.
 Perl returns 404 for both. Already handled — the Go store returns `ErrNotFound`
 separately and a Mongo failure surfaces as 500.
 
+### 1.6 Direct-filesystem Shock reads (phase 2 addition, not in the original plan)
+
+`PORT_PLAN.md` sketches "direct filesystem" as a phase-5, post-cutover
+storage backend. It was pulled forward into phase 2 because
+`lib/Bio/P3/Workspace/WSFileMember.pm:44-191` already does this in Perl (used
+by the zip-archive builder): it resolves a Shock node id to its on-disk path
+(`<data-root>/<id[0:2]>/<id[2:4]>/<id[4:6]>/<id>/<id>.data` — Shock's own
+sharded layout) and opens it directly, skipping the HTTP hop entirely.
+`deploy.cfg`'s `shock-url = 10.1.16.5` (internal, distinct from the public
+`p3.theseed.org` baked into stored `shocknode` URLs) confirms Shock and the
+Workspace services are co-located, which is what makes this worthwhile.
+
+Ported to `go/internal/shockstore` (`NodeIDFromURL`, `ShardedPath`,
+`OpenLocal`), gated by the new `Server.ShockDataDir` field (empty = always use
+HTTP; sourced from a new, Go-only `shock-data-path` deploy.cfg key — Perl has
+no equivalent). Three assumptions, given by the user rather than discovered,
+are load-bearing here and diverge deliberately from `WSFileMember.pm`'s own
+behavior:
+
+1. **There is only one copy of the Shock data tree** — no cache/replica-host
+   divergence to consider.
+2. **A Mongo record carrying a size guarantees the file is already complete
+   on disk** — no torn-write/in-progress-upload race to handle.
+3. **A disagreement (wrong size, or missing entirely) is a hard failure to
+   surface, not a signal to fall back to HTTP.** `WSFileMember.pm` silently
+   falls back to `curl` on any open failure; this port answers 500 instead
+   and logs the node id, path, and both sizes. Papering over a violated
+   invariant is exactly the kind of masked failure that turned the
+   `MAX_PER_HOST` bug into a multi-day investigation (§1 above) — it is not
+   a mistake worth repeating on the read path we control most directly.
+
+A record whose Shock URL simply doesn't parse to a node id (`ErrUnsupportedURL`,
+distinct from `ErrIntegrity`) is a different, non-fatal case — that falls back
+to HTTP, since it is a structural mismatch rather than a corrupted file.
+
+**Reuse note:** `shockstore` has no dependency on `dlstore`/`dlservice`, so a
+future full Go port of the Workspace service can call `OpenLocal` directly for
+its own `get`/`copy`/archive-building needs — the same role `WSFileMember.pm`
+plays for the Perl archive builder today. `workspace.ShockOpenRange` lives in
+the general-purpose Shock/RPC client package `PORT_PLAN.md` already designated
+as reusable. Both are the two backend implementations the `storage.Store`
+interface sketched in `docs/plan-workspace-go-port.md` §3 will need for
+"Shock" and "direct filesystem" — produced now instead of staying a sketch.
+
 ## 2. What is built
 
 ```
-go/cmd/ws-download/main.go          175   binary: flags, config, wiring, graceful shutdown
-go/internal/wsconfig/               180   deploy.cfg [Workspace] INI parser
+go/cmd/ws-download/main.go          180   binary: flags, config, wiring, graceful shutdown
+go/internal/wsconfig/               190   deploy.cfg [Workspace] INI parser
 go/internal/dlstore/                265   mongo: docs, queries, index creation, expiry sweep
-go/internal/dlservice/service.go    363   routing, handlers, streaming
+go/internal/dlservice/service.go    455   routing, handlers, streaming, byteSource backends
 go/internal/dlservice/cors.go        78   Plack::Middleware::CrossOrigin equivalent
 go/internal/dlservice/httprange.go   74   Perl-compatible Range parsing
 go/internal/dlservice/mime.go       115   MIME table + overrides
-                                   ~950   non-test lines
-                                   ~800   test lines
+go/internal/shockstore/              80   Shock node-id -> on-disk path resolution
+go/internal/workspace/shock.go      +55   ShockOpenRange: ctx-aware, ranged, unbuffered
+                                  ~1050   non-test lines (dlservice/dlstore/wsconfig/main only)
+                                   ~950   test lines
 ```
 
 ### Build and test
@@ -374,7 +424,7 @@ go/internal/dlservice/mime.go       115   MIME table + overrides
 ```bash
 cd go
 make server        # CGO_ENABLED=0 -> bin/ws-download
-make test-server   # tests only the four new packages
+make test-server   # tests the six SERVER_PKGS packages
 ```
 
 Both are `CGO_ENABLED=0` and deliberately scoped, so they stay independent of the
@@ -406,7 +456,7 @@ ws-download --config /kb/deployment/deployment.cfg --listen :7129
 
 | Route | Status | Notes |
 |---|---|---|
-| `GET /download/{key}/{name}` | **done** (local files) | Shock backend → 501 |
+| `GET /download/{key}/{name}` | **done** (local + Shock) | Shock: HTTP always works; direct-filesystem fast path when `ShockDataDir` is set |
 | `GET /{key}/{name}` | **done** | legacy form, `/` mount |
 | `GET /view/{ws_path}` | session handling done | resolution → 501 |
 | `GET /archive/{sig}` | lookup + both 404s done | zip streaming → 501 |
@@ -448,6 +498,9 @@ assumed.
   resolve via the `text/plain` fallback anyway. Net behavior matches.
 - Go's `mime.TypeByExtension` is **not** used: its table differs and it appends
   `; charset=utf-8`, which Perl never does. The extension map is vendored instead.
+- **Shock request shape matches `WorkspaceImpl.pm:1939` exactly**: plain
+  `?download` when there's no Range header, `?download&seek=B&length=LEN` when
+  there is. Verified against the Perl source, not assumed.
 
 ### Deliberate deviations
 
@@ -460,12 +513,15 @@ assumed.
 | **Indexes created at startup** | The Perl repo creates none in code. Two of the four exist in production (added out of band); `download_signature` and `expiration_time` do not. Idempotent, so safe on every boot. |
 | Mongo timeout **10s**, not 120s | `:2189` uses 120s; a slow query there blocks every download for two minutes. |
 | Header casing normalized | Perl mixes `Content-Type` (inline) and `Content-type` (attachment). Go canonicalizes; observable on HTTP/1.1 only, and no client cares. |
+| Shock file size mismatch → **hard 500**, never silent HTTP fallback | `WSFileMember.pm` silently retries over HTTP on any local-open failure. This port treats a disagreement as a violated invariant (see §1.6) and fails loudly instead. |
 
 ---
 
 ## 5. Verification
 
-`make test-server` → **78 assertions pass** across the three tested packages.
+`make test-server` → all pass, across the six `SERVER_PKGS` packages (added
+`internal/shockstore` and `internal/workspace` in phase 2; both had no tests
+before this).
 
 ### The regression test for the actual bug
 
@@ -499,12 +555,32 @@ checks actual bytes: full download headers, body, `bytes=2-4` →
   modes, URL-name-ignored, all URL forms, session states, archive bodies.
 - **CORS** — no-Origin, simple, preflight, non-preflight OPTIONS, nested paths.
 - **MIME** — overrides, the case asymmetry, FASTA, no charset parameter.
+- **`shockstore`** — node-id extraction (case, trailing slash, query string,
+  no match), the exact sharded-path formula against hand-computed golden
+  vectors, `OpenLocal` happy path plus size-mismatch and missing-file (both
+  `ErrIntegrity`) and unresolvable-URL (`ErrUnsupportedURL`) against a real
+  temp-dir shard tree.
+- **`workspace.ShockOpenRange`** — exact query string for the ranged vs.
+  whole-file cases, 200 and 206 both accepted, non-2xx surfaces as an error,
+  and a canceled context aborts an in-flight request rather than blocking on
+  it (a real `httptest.Server` handler that hangs until the test releases it).
+- **Shock-backed downloads end to end** — HTTP backend (whole file and
+  ranged, reusing the same Range-header matrix local files get, to prove the
+  `byteSource` unification holds), direct-filesystem backend (happy path with
+  an HTTP client wired to fail any request, to prove the fast path is what
+  actually served it), integrity mismatch → 500 with Shock never queried,
+  missing file → 500, and an unresolvable-URL record falling back to HTTP.
 
 ### Not yet verified
 
-- **No live Mongo was available** on this machine (no local instance, no Docker
-  daemon). `Open`, `EnsureIndexes` and `Sweep` have **never run against a real
-  server**. This is the first thing to exercise.
+- **No live Mongo or Shock was available** on this machine (no local Mongo
+  instance, no Docker daemon, no mounted Shock data volume). `Open`,
+  `EnsureIndexes`, `Sweep`, and the direct-filesystem Shock path have **never
+  run against a real server or a real Shock data tree**. This is the first
+  thing to exercise once such access exists: point `shock-data-path` at a real
+  Shock data root, hit `/download/{key}/{name}` for a known Shock-backed
+  record, and confirm the response is byte-identical with and without the key
+  set (the latter forces the HTTP path).
 - No differential run against the live Perl service yet (phase 4).
 
 ---
@@ -514,8 +590,8 @@ checks actual bytes: full download headers, body, `bytes=2-4` →
 | # | Work | State |
 |---|---|---|
 | 1 | `wsconfig` + `dlstore` + index creation + `/download` local files | **done** (`9c84eab`) |
-| 2 | Shock-backed files: ctx-aware ranged streaming | next |
-| 3 | `p3auth` token validation + `/set-cookie-auth` + `/view` | |
+| 2 | Shock-backed files: ctx-aware ranged streaming, plus an optional direct-filesystem fast path | **done** |
+| 3 | `p3auth` token validation + `/set-cookie-auth` + `/view` | next |
 | 4 | Differential harness vs. the Perl service | |
 | 5 | `/archive` streaming zip in Go | |
 | 6 | SSRF allowlist on shock URLs, log polish | |
@@ -526,25 +602,35 @@ workspace DWNLD button), so the stall is fixed before the archive work starts.
 
 ### Phase 2-3 notes (gaps found in the existing Go module)
 
-The module is 100% client-side today — no HTTP server, no tests, and it had no
-`go.sum` before this work. Specifically:
+The module was 100% client-side before phase 2 — no HTTP server, no tests, and
+it had no `go.sum`. Resolved in phase 2, still open for phase 3:
 
-- **No `context.Context` anywhere** in `shock.go`/`client.go`, so a client
-  disconnect will not cancel the upstream fetch — a real goroutine/socket leak.
-- **`ShockDownloadToWriter` (`shock.go:70`) accepts only 200**, so it rejects the
-  206 a ranged fetch returns. Needs a range-aware sibling.
-- **`ShockDownload` (`shock.go:43`) buffers whole files in memory** — must not be
-  used here.
-- Shock errors are untyped `fmt.Errorf` strings; mapping upstream status to a
-  response code needs a typed error.
-- **`Ls` exposes no `Recursive`/`ExcludeDirectories`**, both of which the archive
-  walk needs.
-- **`auth.parseToken` does no signature or expiry checking** and is unexported. It
-  must never authenticate an inbound request; phase 3 needs a real validator.
-- Default `http.Transport` caps `MaxIdleConnsPerHost` at 2 — tune for a server.
-- `workspace.Client` bakes one token per client, so `/view` needs a per-request
-  client; a shared singleton would leak one user's credentials into another's
-  request.
+- ~~**No `context.Context` anywhere** in `shock.go`/`client.go`~~ — **done**:
+  `ShockOpenRange` takes a `ctx` and uses `http.NewRequestWithContext`.
+- ~~**`ShockDownloadToWriter` (`shock.go:70`) accepts only 200**~~ — **done**:
+  `ShockOpenRange` accepts both 200 and 206 (kept `ShockDownloadToWriter`
+  itself unchanged; nothing in the download service calls it anymore).
+- ~~**`ShockDownload` buffers whole files in memory**~~ — not used by the
+  download service; `ShockOpenRange` streams `resp.Body` directly.
+- ~~Shock errors are untyped `fmt.Errorf` strings~~ — still true of the
+  existing `ShockReadBytes`/`ShockDownload*` methods; `ShockOpenRange`'s own
+  errors are likewise untyped today. Not yet needed: `dlservice` only
+  branches on `shockstore`'s two sentinel errors, never on a Shock HTTP
+  status code.
+- **`Ls` exposes no `Recursive`/`ExcludeDirectories`**, both of which the
+  archive walk (phase 5) needs. Still open.
+- **`auth.parseToken` does no signature or expiry checking** and is
+  unexported. It must never authenticate an inbound request; phase 3 needs a
+  real validator. Still open.
+- Default `http.Transport` caps `MaxIdleConnsPerHost` at 2 — tune for a
+  server. Still open (not yet a problem: `ShockOpenRange` takes an explicit
+  `*http.Client`, so `dlservice.Server.ShockHTTPClient` is the place to set
+  this when it matters).
+- ~~`workspace.Client` bakes one token per client, so `/view` needs a
+  per-request client~~ — sidestepped for Shock reads by making
+  `ShockOpenRange` a free function taking the token as a parameter rather
+  than a `*Client` method. `/view`'s own need for a per-request Workspace RPC
+  client (not just Shock) is still open for phase 3.
 
 ### Token validation algorithm for phase 3
 
