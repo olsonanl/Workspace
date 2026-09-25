@@ -404,6 +404,36 @@ func (c *Client) Du(paths []string, recursive bool) ([]*DiskUsageResult, error) 
 	return response, nil
 }
 
+// getDownloadURLParams matches the get_download_url_params structure in
+// Workspace.spec. Unlike most other RPC params here, the spec declares no
+// adminmode field for this method.
+type getDownloadURLParams struct {
+	Objects []string `json:"objects"`
+}
+
+// GetDownloadURL calls Workspace.get_download_url for the given full object
+// paths and returns the minted URLs, each embedding a download_key valid for
+// a limited time (Workspace.spec:158-170). Used by the ws-download-difftest
+// harness to mint real download keys against real objects rather than
+// fixtures.
+func (c *Client) GetDownloadURL(paths []string) ([]string, error) {
+	params := getDownloadURLParams{
+		Objects: paths,
+	}
+
+	result, err := c.call("get_download_url", params)
+	if err != nil {
+		return nil, err
+	}
+
+	var urls []string
+	if err := json.Unmarshal(result, &urls); err != nil {
+		return nil, fmt.Errorf("failed to parse get_download_url response: %w", err)
+	}
+
+	return urls, nil
+}
+
 // existsParams matches the exists_params structure in Workspace.spec
 type existsParams struct {
 	Objects   []string `json:"objects"`
