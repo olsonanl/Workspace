@@ -87,7 +87,8 @@ func main() {
 		"db_path", cfg.DBPath,
 		"mongo_host", cfg.MongoHost,
 		"mongo_db", cfg.MongoDatabase,
-		"download_lifetime", cfg.DownloadLifetime)
+		"download_lifetime", cfg.DownloadLifetime,
+		"shock_data_dir", cfg.ShockDataDir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -124,6 +125,7 @@ func main() {
 		Log:                   log,
 		EnforceDownloadExpiry: *enforceExp,
 		StrictRangeErrors:     *strictRange,
+		ShockDataDir:          cfg.ShockDataDir,
 	}
 
 	httpSrv := &http.Server{

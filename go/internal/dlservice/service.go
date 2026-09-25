@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"github.com/BV-BRC/Workspace/go/internal/dlstore"
+	"github.com/BV-BRC/Workspace/go/internal/shockstore"
+	"github.com/BV-BRC/Workspace/go/internal/workspace"
 )
 
 // Error bodies, byte-for-byte as the Perl handlers emit them. All four are
@@ -80,6 +82,27 @@ type Server struct {
 	// The Perl code emits a 206 with a negative Content-Length instead. Default
 	// false reproduces Perl; true is correct HTTP.
 	StrictRangeErrors bool
+
+	// ShockDataDir, when non-empty, enables reading Shock-backed objects
+	// directly from the filesystem instead of through the Shock HTTP API --
+	// see go/internal/shockstore. This is a deployment-wide switch (the
+	// service either has access to Shock's data volume or it doesn't), not a
+	// per-record fallback: a record whose file disagrees with its recorded
+	// size is a hard error (500), never silently retried over HTTP. Empty
+	// (the default) always uses the HTTP path.
+	ShockDataDir string
+
+	// ShockHTTPClient is used for Shock-over-HTTP reads, either because
+	// ShockDataDir is unset or because a record's shock URL doesn't resolve
+	// to a local node id. Defaults to http.DefaultClient when nil.
+	ShockHTTPClient *http.Client
+}
+
+func (s *Server) shockHTTPClient() *http.Client {
+	if s.ShockHTTPClient != nil {
+		return s.ShockHTTPClient
+	}
+	return http.DefaultClient
 }
 
 // Handler builds the routed, CORS-wrapped handler.
@@ -251,53 +274,134 @@ func (s *Server) handleSetCookieAuth(w http.ResponseWriter, r *http.Request) {
 	writePlain(w, http.StatusNotImplemented, "Auth support not yet implemented\n")
 }
 
-// sendFile implements _send_ws_file (WorkspaceImpl.pm:1846) for the local-file
-// backend. The Shock backend lands in a later change.
-func (s *Server) sendFile(w http.ResponseWriter, r *http.Request, rec *dlstore.Download, token string, inline bool) {
-	if rec.ShockNode != "" {
-		s.Log.Warn("shock-backed download not yet implemented in Go")
-		writePlain(w, http.StatusNotImplemented, "Shock support not yet implemented\n")
-		return
+// byteSource abstracts a backend that can serve a specific byte range of an
+// object of known size, so streamRanged doesn't care whether it's talking to
+// a local workspace file, a directly-opened Shock file, or Shock over HTTP.
+type byteSource interface {
+	// openRange returns a reader for [start, start+length), or from start to
+	// EOF when length < 0. ctx cancellation must abort any in-flight I/O
+	// (in particular the upstream Shock fetch), not merely stop being read
+	// from -- see workspace.ShockOpenRange's doc comment for why this matters.
+	openRange(ctx context.Context, start, length int64) (io.ReadCloser, error)
+}
+
+// seekerSource adapts a local, already-open *os.File to byteSource. Used for
+// both genuine local workspace files and Shock nodes resolved to a local path
+// by shockstore.OpenLocal -- once opened, the two are indistinguishable.
+type seekerSource struct{ f *os.File }
+
+func (s seekerSource) openRange(_ context.Context, start, length int64) (io.ReadCloser, error) {
+	if _, err := s.f.Seek(start, io.SeekStart); err != nil {
+		return nil, err
 	}
-	if rec.FilePath == "" {
+	if length < 0 {
+		return io.NopCloser(s.f), nil
+	}
+	return io.NopCloser(io.LimitReader(s.f, length)), nil
+}
+
+// httpShockSource adapts workspace.ShockOpenRange to byteSource.
+type httpShockSource struct {
+	hc       *http.Client
+	shockURL string
+	token    string
+}
+
+func (s httpShockSource) openRange(ctx context.Context, start, length int64) (io.ReadCloser, error) {
+	return workspace.ShockOpenRange(ctx, s.hc, s.shockURL, s.token, start, length)
+}
+
+// sendFile implements _send_ws_file (WorkspaceImpl.pm:1846) for both the
+// local-file and Shock backends.
+func (s *Server) sendFile(w http.ResponseWriter, r *http.Request, rec *dlstore.Download, token string, inline bool) {
+	var src byteSource
+	size := rec.Size
+
+	switch {
+	case rec.ShockNode != "":
+		var ok bool
+		src, ok = s.resolveShockSource(w, rec, token)
+		if !ok {
+			return // resolveShockSource already wrote the response
+		}
+
+	case rec.FilePath != "":
+		fh, err := os.Open(rec.FilePath)
+		if err != nil {
+			// Perl logs the path and errno, then 404s (:1965-1968).
+			s.Log.Warn("could not open workspace file", "path", rec.FilePath, "err", err)
+			writePlain(w, http.StatusNotFound, bodyInvalidPath)
+			return
+		}
+		defer fh.Close()
+
+		st, err := fh.Stat()
+		if err != nil {
+			s.Log.Warn("could not stat workspace file", "path", rec.FilePath, "err", err)
+			writePlain(w, http.StatusNotFound, bodyInvalidPath)
+			return
+		}
+		if st.IsDir() {
+			writePlain(w, http.StatusNotFound, bodyNotAFile)
+			return
+		}
+		src = seekerSource{fh}
+
+	default:
 		// Reachable when an archive record is fetched through /download/{key}:
 		// Perl finds the doc, then open(undef) fails and it 404s.
 		writePlain(w, http.StatusNotFound, bodyInvalidPath)
 		return
 	}
 
-	fh, err := os.Open(rec.FilePath)
-	if err != nil {
-		// Perl logs the path and errno, then 404s (:1965-1968).
-		s.Log.Warn("could not open workspace file", "path", rec.FilePath, "err", err)
-		writePlain(w, http.StatusNotFound, bodyInvalidPath)
-		return
-	}
-	defer fh.Close()
-
-	st, err := fh.Stat()
-	if err != nil {
-		s.Log.Warn("could not stat workspace file", "path", rec.FilePath, "err", err)
-		writePlain(w, http.StatusNotFound, bodyInvalidPath)
-		return
-	}
-	if st.IsDir() {
-		writePlain(w, http.StatusNotFound, bodyNotAFile)
-		return
-	}
-
 	// Perl trusts the Mongo `size` field rather than stat(), and reports it in
 	// Content-Range. Keep that so Content-Range matches byte-for-byte even when
 	// the record is stale.
-	size := rec.Size
-
 	setDispositionHeaders(w, rec.Name, inline)
-	s.streamRanged(w, r, fh, size)
+	s.streamRanged(w, r, src, size)
 }
 
-// streamRanged writes the status line, range headers and body for a seekable
-// source.
-func (s *Server) streamRanged(w http.ResponseWriter, r *http.Request, src io.ReadSeeker, size int64) {
+// resolveShockSource picks the Shock backend for rec and returns a byteSource
+// ready to stream. ok is false when it has already written an error response
+// itself (a filesystem integrity failure): the caller must not do anything
+// further with the ResponseWriter.
+func (s *Server) resolveShockSource(w http.ResponseWriter, rec *dlstore.Download, token string) (byteSource, bool) {
+	if s.ShockDataDir != "" {
+		f, err := shockstore.OpenLocal(s.ShockDataDir, rec.ShockNode, rec.Size)
+		switch {
+		case err == nil:
+			return seekerSource{f}, true
+
+		case errors.Is(err, shockstore.ErrIntegrity):
+			// Per this deployment's guarantee that a sized Mongo record means
+			// the backing file is complete, this must never happen -- treat it
+			// as a hard failure rather than silently falling back to HTTP,
+			// which would hide real corruption behind a working response.
+			s.Log.Error("shock file integrity check failed", "node", rec.ShockNode, "err", err)
+			writePlain(w, http.StatusInternalServerError, "Internal error\n")
+			return nil, false
+
+		case errors.Is(err, shockstore.ErrUnsupportedURL):
+			// Structural, not corruption: this record's URL just doesn't look
+			// like a local node reference. Fall through to HTTP below.
+			s.Log.Debug("shock url not resolvable to a local path; using HTTP", "node", rec.ShockNode)
+
+		default:
+			// Should be unreachable -- shockstore.OpenLocal only returns the
+			// two sentinel errors above -- but don't silently swallow a third
+			// kind of failure if one is ever added.
+			s.Log.Error("unexpected error resolving shock file locally", "node", rec.ShockNode, "err", err)
+			writePlain(w, http.StatusInternalServerError, "Internal error\n")
+			return nil, false
+		}
+	}
+
+	return httpShockSource{s.shockHTTPClient(), rec.ShockNode, token}, true
+}
+
+// streamRanged writes the status line, range headers and body for src.
+func (s *Server) streamRanged(w http.ResponseWriter, r *http.Request, src byteSource, size int64) {
+	ctx := r.Context()
 	rng, ok, satisfiable := parseRange(r.Header.Get("Range"), size)
 
 	if ok && !satisfiable {
@@ -316,26 +420,36 @@ func (s *Server) streamRanged(w http.ResponseWriter, r *http.Request, src io.Rea
 	}
 
 	if !ok {
-		// Perl sets no Content-Length on the non-range local path; the response
-		// is chunked. Go would normally add one, so suppress it to match.
+		// Perl sets no Content-Length on the non-range path; the response is
+		// chunked. Go would normally add one, so suppress it to match.
+		body, err := src.openRange(ctx, 0, -1)
+		if err != nil {
+			s.Log.Error("opening backend for streaming failed", "err", err)
+			writePlain(w, http.StatusInternalServerError, "Internal error\n")
+			return
+		}
+		defer body.Close()
 		w.WriteHeader(http.StatusOK)
-		if _, err := io.Copy(w, src); err != nil {
+		if _, err := io.Copy(w, body); err != nil {
 			s.Log.Warn("aborted while streaming body", "err", err)
 		}
 		return
 	}
 
-	if _, err := src.Seek(rng.start, io.SeekStart); err != nil {
-		s.Log.Error("seek failed", "err", err)
+	body, err := src.openRange(ctx, rng.start, rng.length())
+	if err != nil {
+		s.Log.Error("opening backend for ranged streaming failed", "err", err)
 		writePlain(w, http.StatusInternalServerError, "Internal error\n")
 		return
 	}
+	defer body.Close()
+
 	h := w.Header()
 	h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rng.start, rng.end, size))
 	h.Set("Content-Length", strconv.FormatInt(rng.length(), 10))
 	w.WriteHeader(http.StatusPartialContent)
 
-	if _, err := io.Copy(w, io.LimitReader(src, rng.length())); err != nil {
+	if _, err := io.Copy(w, body); err != nil {
 		s.Log.Warn("aborted while streaming ranged body", "err", err)
 	}
 }
