@@ -15,7 +15,7 @@ SERVER_FLAGS := -ldflags="-s -w -X main.version=$(VERSION)"
 SERVER_PKGS := ./cmd/ws-download/... ./internal/dlservice/... ./internal/dlstore/... ./internal/wsconfig/... ./internal/shockstore/... ./internal/workspace/... ./internal/wsresolve/... ./internal/p3auth/... ./internal/serviceauth/...
 
 .PHONY: all build clean linux darwin windows test deps help \
-        server server-linux-amd64 server-linux-arm64 test-server slowclient
+        server server-linux-amd64 server-linux-arm64 test-server slowclient difftest
 
 # Default target - build for current platform
 all: build
@@ -51,6 +51,14 @@ slowclient:
 	@echo "Building slowclient..."
 	@mkdir -p $(OUTDIR)
 	CGO_ENABLED=0 go build $(SERVER_FLAGS) -o $(OUTDIR)/slowclient ./cmd/slowclient
+
+# Phase-4 verification tool: diff the Go ws-download service against the live
+# Perl service for identical requests. See cmd/ws-download-difftest/main.go
+# for the safety notes before pointing it at prod.
+difftest:
+	@echo "Building ws-download-difftest..."
+	@mkdir -p $(OUTDIR)
+	CGO_ENABLED=0 go build $(SERVER_FLAGS) -o $(OUTDIR)/ws-download-difftest ./cmd/ws-download-difftest
 
 # Test only the server packages. Plain `make test` runs ./... which pulls in
 # internal/fuse and therefore needs FUSE headers and a C toolchain; this target
@@ -153,6 +161,7 @@ help:
 	@echo "  server-linux-arm64  Build ws-download for Linux arm64"
 	@echo "  test-server         Test only the ws-download packages"
 	@echo "  slowclient          Build the slow-client stall reproducer"
+	@echo "  difftest            Build the Go-vs-Perl differential test tool"
 	@echo ""
 	@echo "  linux         Build for Linux (amd64 + arm64)"
 	@echo "  linux-amd64   Build for Linux amd64"
