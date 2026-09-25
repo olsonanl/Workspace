@@ -1,13 +1,21 @@
 // Package dlstore is the MongoDB layer for the download service.
 //
-// It only ever reads the two collections the Perl RPC service writes:
+// It reads four collections the Perl RPC service writes:
 //
 //	downloads    - written by Workspace.get_download_url (single files) and
 //	               Workspace.get_archive_url (archives)
 //	auth_cookie  - written by the /set-cookie-auth route
+//	workspaces   - the RPC service's own workspace records, read (never
+//	               written) for /view's live permission check
+//	objects      - the RPC service's own object records, read (never
+//	               written) for /view's live path resolution
 //
-// The document shapes are fixed by the Perl writers (WorkspaceImpl.pm:3102-3171
-// and :3396-3412), so the bson tags here are a contract, not a choice.
+// The document shapes are fixed by the Perl writers (WorkspaceImpl.pm:3102-3171,
+// :3396-3412, :1097-1104 and :1126-1202), so the bson tags here are a contract,
+// not a choice. workspaces and objects are read-only from this package's point
+// of view: /view's resolution path (see FindObject) deliberately does not
+// reproduce two write side effects Perl's own read path has -- see that
+// function's doc comment.
 package dlstore
 
 import (
@@ -80,11 +88,13 @@ func (a *AuthCookie) Expired(now time.Time) bool {
 	return a.ExpirationTime < now.Unix()
 }
 
-// Store owns the Mongo client and the two collections.
+// Store owns the Mongo client and its collections.
 type Store struct {
 	client     *mongo.Client
 	downloads  *mongo.Collection
 	authCookie *mongo.Collection
+	workspaces *mongo.Collection
+	objects    *mongo.Collection
 	log        *slog.Logger
 }
 
@@ -116,6 +126,8 @@ func Open(ctx context.Context, uri, database string, log *slog.Logger) (*Store, 
 		client:     client,
 		downloads:  db.Collection("downloads"),
 		authCookie: db.Collection("auth_cookie"),
+		workspaces: db.Collection("workspaces"),
+		objects:    db.Collection("objects"),
 		log:        log,
 	}, nil
 }
@@ -146,6 +158,12 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 		{s.downloads, "expiration_time_1", bson.D{{Key: "expiration_time", Value: 1}}, nil},
 		{s.authCookie, "session_token_1", bson.D{{Key: "session_token", Value: 1}}, nil},
 		{s.authCookie, "expiration_time_1", bson.D{{Key: "expiration_time", Value: 1}}, nil},
+		// The hot lookup for /view's object resolution (FindObject).
+		{s.objects, "workspace_uuid_1_path_1_name_1", bson.D{
+			{Key: "workspace_uuid", Value: 1}, {Key: "path", Value: 1}, {Key: "name", Value: 1},
+		}, nil},
+		{s.workspaces, "owner_1_name_1", bson.D{{Key: "owner", Value: 1}, {Key: "name", Value: 1}}, nil},
+		{s.workspaces, "uuid_1", bson.D{{Key: "uuid", Value: 1}}, nil},
 	}
 
 	for _, spec := range specs {
