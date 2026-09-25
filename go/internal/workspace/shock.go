@@ -61,6 +61,63 @@ func ShockOpenRange(ctx context.Context, hc *http.Client, shockURL, token string
 	return resp.Body, nil
 }
 
+// ACLError reports a non-2xx response from EnsureShockReadACL, preserving the
+// status code so a caller can distinguish (for example) a 401 worth retrying
+// with a fresh service token from any other failure.
+type ACLError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *ACLError) Error() string {
+	return fmt.Sprintf("shock acl grant failed: %s - %s", e.Status, e.Body)
+}
+
+// EnsureShockReadACL grants user read access to a Shock node, authenticating
+// as a service account rather than as the user being granted access. Mirrors
+// the ACL PUT in _lookup_ws_file_details (WorkspaceImpl.pm:1817-1823, whose
+// comment reads "ACL change requires using the workspace owner token").
+//
+// Two deliberate deviations from Perl, both fixes rather than behavior
+// changes a caller needs to accommodate:
+//
+//   - hc must carry a timeout. Perl's LWP::UserAgent->new() here has none,
+//     making this PUT one of the documented sources of the multi-hour
+//     production stall this port exists to fix.
+//   - The response is inspected and returned as an error on failure. Perl
+//     assigns it to a variable and never looks at it (:1823), so a failed
+//     grant today surfaces only as a mystery 403 when Shock is fetched
+//     afterward, with nothing in this service's own logs to explain it.
+//
+// user is interpolated into the query string exactly as Perl does --
+// unescaped, not through url.Values (which would percent-encode "@" as
+// "%40"). A real BV-BRC username always contains "@", so matching Perl's
+// literal wire format here, rather than a more "correct" encoding, is the
+// safer choice until it's confirmed Shock accepts the encoded form the same
+// way.
+func EnsureShockReadACL(ctx context.Context, hc *http.Client, shockNodeURL, serviceToken, user string) error {
+	target := shockNodeURL + "/acl/read?users=" + user
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, nil)
+	if err != nil {
+		return fmt.Errorf("building shock acl request: %w", err)
+	}
+	req.Header.Set("Authorization", "OAuth "+serviceToken)
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("granting shock read acl: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return &ACLError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(body)}
+	}
+	return nil
+}
+
 // ShockReadBytes reads a range of bytes from a Shock URL
 func (c *Client) ShockReadBytes(shockURL string, offset, length int64) ([]byte, error) {
 	url := fmt.Sprintf("%s?download&seek=%d&length=%d", shockURL, offset, length)
