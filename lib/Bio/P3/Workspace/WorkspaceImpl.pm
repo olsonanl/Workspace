@@ -1464,6 +1464,52 @@ sub _formatQuery {
 #
 
 #
+# Determine the originating client address for a download request.
+#
+# The download service sits behind nginx, so $req->address is always the
+# proxy. The real client is in the forwarding headers.
+#
+# This deliberately mirrors Bio::P3::Workspace::Service::getIPAddress
+# (Service.pm:187) so the download log and the RPC service agree on what
+# "the client" means: X-Forwarded-For first hop, then X-Real-IP, then the
+# socket peer.
+#
+# X-Forwarded-For is a comma-separated chain, "client, proxy1, proxy2",
+# appended to by each hop. The FIRST entry is the originating client.
+#
+# Caveat: X-Forwarded-For is client-supplied and trivially spoofable. If a
+# client sends its own header, nginx's proxy_add_x_forwarded_for appends
+# to it rather than replacing it, so the first entry is whatever the
+# client claimed. This is fine for diagnostics -- correlating a stall with
+# who was downloading -- but must not be used for authentication or
+# access control. Service.pm has the same exposure and the same caveat.
+#
+sub _client_address
+{
+    my($self, $req) = @_;
+
+    my $xff = $req->header("X-Forwarded-For");
+    if (defined($xff))
+    {
+	my($first) = split(/,/, $xff);
+	if (defined($first))
+	{
+	    $first =~ s/^\s+|\s+$//g;
+	    return $first if length($first);
+	}
+    }
+
+    my $real = $req->header("X-Real-IP");
+    if (defined($real))
+    {
+	$real =~ s/^\s+|\s+$//g;
+	return $real if length($real);
+    }
+
+    return $req->address // '-';
+}
+
+#
 # Start the download service. This will create a timer to garbage-collect
 # download records from the mongodb.
 #
@@ -1935,27 +1981,101 @@ sub _send_ws_file
 	    {
 		@headers = (headers => {Authorization => "OAuth $token" });
 	    }
-	    # print STDERR "retrieve $url\n" . Dumper(@headers);
+	    #
+	    # Per-fetch instrumentation.
+	    #
+	    # This replaces a Data::Dumper of every response's headers. That
+	    # debug statement was accidentally load-bearing: during the
+	    # 2026-09-24 stall it was the only clock in the error log (via
+	    # Shock's HTTP 'date' header) and was how the stall was located.
+	    # It is also far too verbose -- ~20 lines per request -- and
+	    # serializing it costs the event loop on every fetch.
+	    #
+	    # What is kept is the timing, which is what the diagnosis actually
+	    # needed: how long the headers took to come back (ttfb), how long
+	    # the whole body took, how many bytes moved, and the status. One
+	    # line per fetch, emitted at completion.
+	    #
+	    my $t_start = gettimeofday();
+	    my $t_hdr;
+	    my $n_bytes = 0;
+	    my $status  = '?';
+	    my $client_gone = 0;
+	    my $client_ip = $self->_client_address($req);
+
 	    http_request(GET => $url,
 			 @headers,
 			 # handle_params => { max_read_size => 32768 },
-			 on_header => sub { print STDERR Dumper(@_); },
+			 on_header => sub {
+			     my($hdr) = @_;
+			     $t_hdr  = gettimeofday();
+			     $status = $hdr->{Status} // '?';
+			     return 1;
+			 },
 			 on_body => sub {
 			     my($data, $hdr) = @_;
-			     # print STDERR Dumper($hdr);
 			     if ($data)
 			     {
-				 $writer->write($data);
-				 my $len = length($data);
+				 #
+				 # $writer->write is Twiggy::Writer::write, which is
+				 # push_write on the client's AnyEvent::Handle. If the
+				 # client has gone away that handle's _drain_wbuf hits
+				 # a write error and croaks "AnyEvent::Handle uncaught
+				 # error: Broken pipe" -- there is no on_error on the
+				 # Twiggy writer handle. The exception propagates out
+				 # of on_body into AnyEvent::HTTP's on_read callback
+				 # (HTTP.pm:1084), where EV catches and IGNORES it.
+				 #
+				 # Ignoring it is the problem: on_body never returns,
+				 # so it never returns 0, so $finish is never called
+				 # and the Shock fetch is never cancelled. The upstream
+				 # read callback stays installed and keeps firing for
+				 # every remaining byte of the response -- each one
+				 # throwing again. With a 253 MB body that is a very
+				 # large number of throw/catch cycles at full CPU,
+				 # which is the 100% spin seen during the 200-client
+				 # test. It ends only when the upstream body is
+				 # exhausted, which is why it "cleared itself".
+				 #
+				 # Catching the write error and returning 0 cancels the
+				 # fetch immediately: AnyEvent::HTTP finishes with 598
+				 # and tears the connection down.
+				 #
+				 my $ok = eval { $writer->write($data); 1 };
+				 if (!$ok)
+				 {
+				     # Client hung up mid-transfer. Normal, not an error.
+				     $client_gone = 1;
+				     return 0;
+				 }
+				 $n_bytes += length($data);
 				 return 1;
 			     }
 			     else
 			     {
-				 $writer->close();
+				 eval { $writer->close() };
 				 return 0;
 			     }
 			 },
-			 sub {});
+			 sub {
+			     my $now = gettimeofday();
+			     #
+			     # ttfb is the number to watch. During the stall the
+			     # gap was BETWEEN fetches rather than inside them,
+			     # so a large total with a small ttfb points at the
+			     # body transfer (slow client, no backpressure),
+			     # while a large ttfb points upstream.
+			     #
+			     printf STDERR "shock-fetch client=%s status=%s ttfb=%.3f total=%.3f bytes=%d%s%s url=%s\n",
+				    $client_ip,
+				    $status,
+				    (defined $t_hdr ? $t_hdr - $t_start : -1),
+				    $now - $t_start,
+				    $n_bytes,
+				    ($client_gone ? " client_gone=1" : ""),
+				    ($have_range ? " range=$range_beg-$range_end" : ""),
+				    $url;
+			 });
 	};
 		     
     }
@@ -1978,7 +2098,10 @@ sub _send_ws_file
 	    seek($fh, $range_beg, SEEK_SET);
 	}
 
-	print STDERR "Opened $ws_obj->{file_path} fh=$fh\n";
+	my $client_ip = $self->_client_address($req);
+	my $t_start = gettimeofday();
+	my $n_bytes = 0;
+	my $client_gone = 0;
 
 	return sub {
 	    my($responder) = @_;
@@ -1998,13 +2121,40 @@ sub _send_ws_file
 		$writer = $responder->([200, \@resp_headers]);
 	    }
 
-	    print STDERR "retrieve $ws_obj->{file_path}\n";
+	    #
+	    # Emitted once per transfer at completion, mirroring the shock-fetch
+	    # line so both backends are greppable the same way.
+	    #
+	    my $log_done = sub {
+		printf STDERR "file-fetch client=%s total=%.3f bytes=%d%s%s path=%s\n",
+		       $client_ip,
+		       gettimeofday() - $t_start,
+		       $n_bytes,
+		       ($client_gone ? " client_gone=1" : ""),
+		       ($have_range ? " range=$range_beg-$range_end" : ""),
+		       $ws_obj->{file_path};
+	    };
+
 	    my $ah;
 	    $ah = new AnyEvent::Handle(fh => $fh,
-				       on_error => sub { print STDERR "Error\n"; },
+				       #
+				       # Must tear the handle down, exactly as on_eof
+				       # does. The previous version only printed, so the
+				       # handle stayed alive with a dead descriptor and
+				       # the loop could re-poll it indefinitely.
+				       #
+				       on_error => sub {
+					   my($h, $fatal, $message) = @_;
+					   # Almost always the client hanging up mid-transfer.
+					   $client_gone = 1;
+					   eval { $writer->close() };
+					   undef $ah;
+					   $log_done->();
+				       },
 				       on_eof => sub {
 					   $writer->close();
 					   undef $ah;
+					   $log_done->();
 				       },
 				       on_read => sub {
 					   my($h) = @_;
@@ -2015,14 +2165,18 @@ sub _send_ws_file
 
 					       if ($have_range && ($len > $range_len))
 					       {
-						   $writer->write(substr($h->{rbuf}, 0, $range_len));
+						   my $chunk = substr($h->{rbuf}, 0, $range_len);
+						   $n_bytes += length($chunk);
+						   $writer->write($chunk);
 						   $h->rbuf = '';
 						   $writer->close();
 						   undef $ah;
+						   $log_done->();
 					       }
 					       else
 					       {
 						   $range_len -= $len if $have_range;
+						   $n_bytes += $len;
 						   $writer->write($h->{rbuf});
 						   $h->rbuf = '';
 					       }
@@ -2031,6 +2185,7 @@ sub _send_ws_file
 					   {
 					       $writer->close();
 					       undef $ah;
+					       $log_done->();
 					   }
 				       });
 	};
