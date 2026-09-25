@@ -186,8 +186,9 @@ client-side, has no HTTP server, no tests, no `go.sum`, no mongo dep):
 - `auth.parseToken` does **no** signature or expiry checking and is unexported. It must
   never authenticate an inbound request.
 - Default `http.Transport` caps `MaxIdleConnsPerHost` at 2 — tune for a server.
-- There is **no `go.sum` and no `vendor/`** (only `pflag` and `cgofuse` are required today).
-  Adding the Mongo driver generates a large first `go.sum` — expect that diff and commit it.
+- ~~There is no `go.sum` and no `vendor/`~~ — stale as of phase 1: adding the
+  Mongo driver generated a `go.sum`, which has existed and been committed
+  since then.
 
 `/view` needs the Workspace permission check that `_lookup_ws_file_details` performs. The
 Go `workspace.Client` bakes one token per client, so per-request clients (or a
@@ -197,16 +198,21 @@ credentials into another's request.
 ### Token validation (`internal/p3auth`)
 
 Port `P3TokenValidator::validate` exactly
-(`/Users/olson/P3/dev-slurm/modules/p3_auth/lib/P3TokenValidator.pm:26`):
+(`/home/olson/P3/dev-ubuntu/modules/p3_auth/lib/P3TokenValidator.pm:26`):
 take everything before `|sig=` as signed data; parse `|`-separated `k=v`; reject if
 `time >= expiry`; reject unless `SigningSubject` is in the trusted list
-(`P3AuthConstants.pm`: `rast.nmpdr.org/goauth/keys`, `user.alpha.patricbrc.org/public_key`,
+(`P3AuthConstants.pm`, **five** entries: `rast.nmpdr.org/goauth/keys`,
+`user.alpha.patricbrc.org/public_key`, `user.beta.patricbrc.org/public_key`,
 `nexus.api.globusonline.org/goauth/keys`, `user.patricbrc.org/public_key`); fetch the
 signer URL (JSON `{valid, pubkey}`), and RSA-verify the hex-decoded `sig` over the signed
 data using **SHA-1** (`crypto/rsa.VerifyPKCS1v15` + `crypto.SHA1`). Cache pubkeys 86400s.
 
 SHA-1 is required for compatibility — it is what the signers emit. Note it in the code,
 do not silently "upgrade" it.
+
+> Implemented in phase 3 as `internal/p3auth`; see `PORT_STATUS.md` §"Token
+> validation" for the as-built details (`ParseUnverified`, the cache, and the
+> five-signer correction — an earlier draft of this section had only four).
 
 ### Mongo (`internal/dlstore`)
 
@@ -291,7 +297,10 @@ change is external.
 1. `wsconfig` + `dlstore` + **index creation**, and a `/download` route for local files only.
    Verifiable immediately: fastest win, exercises the whole stack.
 2. Shock-backed files with ctx-aware ranged streaming (extend `shock.go`).
-3. `p3auth` + `/set-cookie-auth` + `/view` + mime table.
+3. `p3auth` + `/set-cookie-auth` + `/view`. (The mime table moved earlier in
+   practice — built alongside `/download` in phase 2 as
+   `internal/dlservice/mime.go`, since `/download` already needed to set
+   `Content-Type` for local files.)
 4. Differential harness; run everything above against Perl.
 5. `/archive` in Go.
 6. Expiry sweep, graceful shutdown, structured logging (`log/slog`), SSRF allowlist.

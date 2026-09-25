@@ -98,8 +98,13 @@ over HTTP, unchanged from today.
 
 ## /view: workspace resolution and permissions
 
-Not yet ported (phase 3), but worth recording now — these are all verified
-against `WorkspaceImpl.pm` directly, not inferred:
+Ported in phase 3 (`internal/wsresolve` for the pure path-parsing/permission
+logic, `dlstore`'s `workspaces`/`objects` collections for the Mongo reads,
+`dlservice.resolveView`/`ensureShockACL` for the request-time wiring). The
+gotchas below are all verified against `WorkspaceImpl.pm` directly, not
+inferred, and describe what the port had to get right — see
+`go/cmd/ws-download/PORT_STATUS.md` §"Design decisions for `/view`" for how
+each was resolved:
 
 - **`_get_ws_permission` (`:405`) checks "published" before "owner."** A
   workspace with `global_permission eq "p"` returns `"p"` at `:407-409`,
@@ -127,14 +132,19 @@ against `WorkspaceImpl.pm` directly, not inferred:
   rewrites the caller's `$query->{path}` in place, stripping leading/trailing
   `/` (`:657-660`), and when two documents share `(workspace_uuid, path,
   name)` it `remove()`s one from Mongo (`:682-687`) rather than just
-  returning both. A GET request can delete a document. Anyone porting this
-  needs to decide deliberately whether to keep that behavior.
+  returning both. A GET request can delete a document. **Decided for the Go
+  port: omit both side effects.** `dlstore.FindObject` picks the duplicate
+  deterministically (sorted by `uuid`) and logs a warning instead of deleting;
+  see the next bullet for the other side effect.
 - **The same function can block on the network and spawn subprocesses.** A
   row with `shock == 1 && size == 0` triggers `_update_shock_node` (`:814`):
   a synchronous LWP GET to Shock, a Mongo write, and potentially spawning a
   `ws-autometa-*.pl` script. On the download service's single-threaded
   Twiggy event loop this is a second, uncatalogued stall source alongside the
-  `MAX_PER_HOST` one below.
+  `MAX_PER_HOST` one below. `dlstore.FindObject` logs a warning for this case
+  too and does not attempt the refresh — the direct-filesystem Shock backend
+  can stat the real file itself, so a stale zero size there is recoverable
+  without a Mongo write anyway.
 - **`_wsauth` (`:164`) caches the service-account token forever**, with no
   expiry check, no refresh, and no invalidation on a 401. Since the download
   service is one long-lived process, an expired token makes the `/view`
@@ -143,7 +153,10 @@ against `WorkspaceImpl.pm` directly, not inferred:
   also uses a bare `LWP::UserAgent->new()` with no timeout. Related:
   `P3AuthLogin::login_rast` (in `p3_auth`) authenticates over **plain HTTP**
   (`http://rast.nmpdr.org/goauth/token`) with the credentials in a Basic
-  auth header.
+  auth header. The Go `internal/serviceauth.TokenSource` caches with a 30-minute
+  TTL and retries once on a 401 (invalidating the cached token first) — both
+  differences from Perl are deliberate, since a forever-cached token in a
+  long-lived process is exactly the silent-failure mode described here.
 - `/view` never sets `_adminmode`, so the admin bypass at `:433` is dead code
   on this path — don't port it into a Go `/view` handler. And every failure
   mode (object not found, path is a folder, permission denied) collapses to
@@ -234,11 +247,13 @@ first real use, after days of inference from logs that recorded the wrong thing.
 ## Go components (`go/`)
 
 - `cmd/p3-mount-ws` — FUSE driver. Needs CGO and platform FUSE headers.
-- `cmd/ws-download` — in-progress Go port of the download service, phases 1-2
-  of 7 done: `/download` serves both local-filesystem and Shock-backed files
-  (ranged, ctx-cancellable). `/view` and `/set-cookie-auth` still answer 501.
+- `cmd/ws-download` — in-progress Go port of the download service, phases 1-3
+  of 7 done: `/download`, `/view`, and `/set-cookie-auth` all serve real
+  traffic (local files, Shock-backed files ranged/ctx-cancellable, and the
+  optional direct-filesystem fast path); only `/archive` still answers 501.
   See `go/cmd/ws-download/PORT_STATUS.md`, whose §1.5 lists the six defects the
-  port must not reproduce, and §1.6 for the direct-Shock-read design below.
+  port must not reproduce, and §1.6-1.7 for the direct-Shock-read design and a
+  phase-2 fd leak found and fixed in phase 3.
 - `cmd/slowclient` — load tool for reproducing download stalls against a live
   service. Read its header for safety notes before pointing it at production.
 

@@ -5,10 +5,11 @@ Port of the Perl `WorkspaceDownload` service (`lib/WorkspaceDownload.psgi` +
 
 - **Branch:** `feature/go-download-service`
 - **Phase 1 commit:** `9c84eab`
-- **Status:** phase 2 of 7 complete. `/download` serves both local files and
-  Shock-backed files end to end (HTTP and an optional direct-filesystem fast
-  path); `/view`, `/archive`, and `/set-cookie-auth` return 501 with their
-  routing, session handling and error paths already in place and tested.
+- **Status:** phase 3 of 7 complete. `/download`, `/view`, and
+  `/set-cookie-auth` all serve traffic end to end (local files, Shock over
+  HTTP, and the optional direct-filesystem fast path); only `/archive` still
+  returns 501, with its routing and both 404 shapes already in place and
+  tested.
 - **Last updated:** 2026-09-25
 
 ---
@@ -403,20 +404,42 @@ as reusable. Both are the two backend implementations the `storage.Store`
 interface sketched in `docs/plan-workspace-go-port.md` §3 will need for
 "Shock" and "direct filesystem" — produced now instead of staying a sketch.
 
+### 1.7 A phase-2 file-descriptor leak (found and fixed in phase 3)
+
+Found while extending `sendFile` for `/view`, in code already committed and
+shipped in phase 2 — not something this session introduced. `sendFile`
+(`service.go`) closed the `*os.File` it opened itself for a local-file record
+(`defer fh.Close()`) but never closed the `*os.File` `shockstore.OpenLocal`
+returns for the Shock direct-filesystem branch; `seekerSource.openRange` handed
+that file out wrapped in `io.NopCloser`, so nothing downstream closed it either.
+Every Shock download served off the direct-filesystem fast path leaked one fd
+until process exit.
+
+Fixed by giving `seekerSource` a real `Close() error` and doing the close once,
+uniformly, in `sendFile`: `if c, ok := src.(io.Closer); ok { defer c.Close() }`,
+which also removed the branch-local `defer fh.Close()`. `httpShockSource` opens
+nothing of its own per source, so it needs no closer.
+
+Regression test: `TestShockDirectFilesystemDoesNotLeakFileDescriptors`
+(`shock_test.go`) counts `/proc/self/fd` before and after 25 direct-filesystem
+Shock downloads. Verified the test actually catches the bug by temporarily
+reverting the fix and confirming fd count grew (7→32) instead of staying flat.
+
 ## 2. What is built
 
 ```
-go/cmd/ws-download/main.go          180   binary: flags, config, wiring, graceful shutdown
-go/internal/wsconfig/               190   deploy.cfg [Workspace] INI parser
-go/internal/dlstore/                265   mongo: docs, queries, index creation, expiry sweep
-go/internal/dlservice/service.go    455   routing, handlers, streaming, byteSource backends
-go/internal/dlservice/cors.go        78   Plack::Middleware::CrossOrigin equivalent
-go/internal/dlservice/httprange.go   74   Perl-compatible Range parsing
-go/internal/dlservice/mime.go       115   MIME table + overrides
-go/internal/shockstore/              80   Shock node-id -> on-disk path resolution
-go/internal/workspace/shock.go      +55   ShockOpenRange: ctx-aware, ranged, unbuffered
-                                  ~1050   non-test lines (dlservice/dlstore/wsconfig/main only)
-                                   ~950   test lines
+go/cmd/ws-download/main.go          binary: flags, config, wiring, graceful shutdown
+go/internal/wsconfig/               deploy.cfg [Workspace] INI parser
+go/internal/dlstore/                mongo: downloads/auth_cookie/workspaces/objects, index creation, expiry sweep
+go/internal/dlservice/service.go    routing, handlers, streaming, byteSource backends, /view resolution
+go/internal/dlservice/cors.go       Plack::Middleware::CrossOrigin equivalent
+go/internal/dlservice/httprange.go  Perl-compatible Range parsing
+go/internal/dlservice/mime.go       MIME table + overrides
+go/internal/shockstore/             Shock node-id -> on-disk path resolution
+go/internal/workspace/shock.go      ShockOpenRange (ctx-aware, ranged, unbuffered) + EnsureShockReadACL
+go/internal/wsresolve/              path parsing, permission ladder, Mongo username escaping (pure, stdlib-only)
+go/internal/p3auth/                 inbound token validation (RSA/SHA-1) + ParseUnverified
+go/internal/serviceauth/            cached service-account token for the Shock ACL grant
 ```
 
 ### Build and test
@@ -424,7 +447,7 @@ go/internal/workspace/shock.go      +55   ShockOpenRange: ctx-aware, ranged, unb
 ```bash
 cd go
 make server        # CGO_ENABLED=0 -> bin/ws-download
-make test-server   # tests the six SERVER_PKGS packages
+make test-server   # tests all SERVER_PKGS packages
 ```
 
 Both are `CGO_ENABLED=0` and deliberately scoped, so they stay independent of the
@@ -458,10 +481,10 @@ ws-download --config /kb/deployment/deployment.cfg --listen :7129
 |---|---|---|
 | `GET /download/{key}/{name}` | **done** (local + Shock) | Shock: HTTP always works; direct-filesystem fast path when `ShockDataDir` is set |
 | `GET /{key}/{name}` | **done** | legacy form, `/` mount |
-| `GET /view/{ws_path}` | session handling done | resolution → 501 |
+| `GET /view/{ws_path}` | **done** | live Mongo resolution + permission check; local and Shock-backed objects; grants a Shock read ACL only over the HTTP backend |
 | `GET /archive/{sig}` | lookup + both 404s done | zip streaming → 501 |
 | `GET /download/archive/{sig}` | same | routes to the archive handler |
-| `POST /set-cookie-auth` | 401 path done | token validation → 501 |
+| `POST /set-cookie-auth` | **done** | token validated via `p3auth`; mints and stores a session, sets the cookie |
 | CORS (all routes) | **done** | verified against the live service |
 
 ---
@@ -515,13 +538,41 @@ assumed.
 | Header casing normalized | Perl mixes `Content-Type` (inline) and `Content-type` (attachment). Go canonicalizes; observable on HTTP/1.1 only, and no client cares. |
 | Shock file size mismatch → **hard 500**, never silent HTTP fallback | `WSFileMember.pm` silently retries over HTTP on any local-open failure. This port treats a disagreement as a violated invariant (see §1.6) and fails loudly instead. |
 
+### Design decisions for `/view` (phase 3)
+
+Three forks were resolved with the user before implementation:
+
+1. **Resolve workspace paths in Go against Mongo directly, not via a JSONRPC
+   call to the Perl RPC service.** Matches what Perl itself does (also
+   in-process Mongo), avoids a per-`/view` network hop and a hard runtime
+   dependency on the RPC service being up, and produces exactly the code a
+   future full Go port of the Workspace service would need anyway — new
+   `internal/wsresolve` package plus `workspaces`/`objects` collections in
+   `dlstore`.
+2. **Omit both of `_query_database`'s read-path side effects: log instead of
+   reproducing them.** Perl's read path can `remove()` a duplicate
+   `(workspace_uuid, path, name)` document and, for a `shock==1 && size==0`
+   row, fire a synchronous Shock GET, a Mongo write, and potentially spawn a
+   `ws-autometa-*.pl` subprocess — all from what is nominally a GET. The Go
+   `dlstore.FindObject` takes the first duplicate deterministically (sorted by
+   `uuid`) and logs a warning for both cases, deleting and mutating nothing.
+3. **Grant the Shock read ACL only when the HTTP backend is actually used,
+   never for the direct-filesystem fast path.** A direct-filesystem read never
+   talks to Shock at all, so the PUT would be pure overhead with nothing to
+   authorize. `ensureShockACL` is called from the HTTP-fallback branch of
+   `resolveShockSource` only; `TestViewGrantsShockACLOnlyOverHTTP` asserts both
+   halves (the PUT fires over HTTP; a direct-FS read with a
+   `failingRoundTripper` transport still succeeds, proving no Shock traffic of
+   any kind was attempted).
+
 ---
 
 ## 5. Verification
 
-`make test-server` → all pass, across the six `SERVER_PKGS` packages (added
-`internal/shockstore` and `internal/workspace` in phase 2; both had no tests
-before this).
+`make test-server` → all pass, across all nine `SERVER_PKGS` packages
+(`internal/shockstore` and `internal/workspace` added in phase 2;
+`internal/wsresolve`, `internal/p3auth`, and `internal/serviceauth` added in
+phase 3 — all had no tests before their respective phase).
 
 ### The regression test for the actual bug
 
@@ -570,6 +621,18 @@ checks actual bytes: full download headers, body, `bytes=2-4` →
   an HTTP client wired to fail any request, to prove the fast path is what
   actually served it), integrity mismatch → 500 with Shock never queried,
   missing file → 500, and an unresolvable-URL record falling back to HTTP.
+- **`wsresolve`** — the full `ParseWSPath` matrix (all path shapes, greedy
+  path/name split, trailing slash, no-match), the permission ladder including
+  published-before-owner and owner-of-published, and the escape/unescape round
+  trip including the documented non-inverse asymmetry.
+- **`p3auth`** — valid/expired/missing-expiry/unknown-signer/tampered-signature/
+  no-`|sig=`/`valid:false` tokens, both PEM encodings, and a cache-hit
+  assertion (two validations, one signer fetch).
+- **`/view` and `/set-cookie-auth`** — happy path local and Shock-backed,
+  permission denied, folder, missing object, unknown workspace, and malformed
+  path (all → 404 `Invalid path`); the ACL-grant-only-over-HTTP split; and for
+  `/set-cookie-auth`: no-header 401, bad-token 403, and a 200 that sets the
+  cookie with the right attributes and calls `InsertSession`.
 
 ### Not yet verified
 
@@ -581,6 +644,12 @@ checks actual bytes: full download headers, body, `bytes=2-4` →
   Shock data root, hit `/download/{key}/{name}` for a known Shock-backed
   record, and confirm the response is byte-identical with and without the key
   set (the latter forces the HTTP path).
+- **`/set-cookie-auth`'s 403 wire format is unconfirmed against the live
+  service.** Perl's failure path (`WorkspaceImpl.pm:1533`) passes a bare
+  string where PSGI expects an arrayref — malformed PSGI, so what actually
+  reaches the client on a bad token is unknown without testing it live. Go
+  emits a well-formed `403 Authentication failed` with no `Content-Type`; this
+  needs a byte-for-byte check against the real service, not an assumption.
 - No differential run against the live Perl service yet (phase 4).
 
 ---
@@ -591,8 +660,8 @@ checks actual bytes: full download headers, body, `bytes=2-4` →
 |---|---|---|
 | 1 | `wsconfig` + `dlstore` + index creation + `/download` local files | **done** (`9c84eab`) |
 | 2 | Shock-backed files: ctx-aware ranged streaming, plus an optional direct-filesystem fast path | **done** |
-| 3 | `p3auth` token validation + `/set-cookie-auth` + `/view` | next |
-| 4 | Differential harness vs. the Perl service | |
+| 3 | `p3auth` token validation + `/set-cookie-auth` + `/view` | **done** |
+| 4 | Differential harness vs. the Perl service | next |
 | 5 | `/archive` streaming zip in Go | |
 | 6 | SSRF allowlist on shock URLs, log polish | |
 | 7 | Deploy side-by-side, diff on real traffic, nginx cutover | |
@@ -603,7 +672,7 @@ workspace DWNLD button), so the stall is fixed before the archive work starts.
 ### Phase 2-3 notes (gaps found in the existing Go module)
 
 The module was 100% client-side before phase 2 — no HTTP server, no tests, and
-it had no `go.sum`. Resolved in phase 2, still open for phase 3:
+it had no `go.sum`. Resolved in phase 2, resolved or reassessed in phase 3:
 
 - ~~**No `context.Context` anywhere** in `shock.go`/`client.go`~~ — **done**:
   `ShockOpenRange` takes a `ctx` and uses `http.NewRequestWithContext`.
@@ -619,32 +688,48 @@ it had no `go.sum`. Resolved in phase 2, still open for phase 3:
   status code.
 - **`Ls` exposes no `Recursive`/`ExcludeDirectories`**, both of which the
   archive walk (phase 5) needs. Still open.
-- **`auth.parseToken` does no signature or expiry checking** and is
+- ~~**`auth.parseToken` does no signature or expiry checking** and is
   unexported. It must never authenticate an inbound request; phase 3 needs a
-  real validator. Still open.
+  real validator.~~ — **done**: `internal/p3auth.Validator` (real RSA/SHA-1
+  verification, matching `P3TokenValidator::validate`) backs
+  `/set-cookie-auth`; the pre-existing `auth.parseToken` is untouched and
+  still must never be used to authenticate an inbound request.
 - Default `http.Transport` caps `MaxIdleConnsPerHost` at 2 — tune for a
   server. Still open (not yet a problem: `ShockOpenRange` takes an explicit
   `*http.Client`, so `dlservice.Server.ShockHTTPClient` is the place to set
   this when it matters).
 - ~~`workspace.Client` bakes one token per client, so `/view` needs a
-  per-request client~~ — sidestepped for Shock reads by making
-  `ShockOpenRange` a free function taking the token as a parameter rather
-  than a `*Client` method. `/view`'s own need for a per-request Workspace RPC
-  client (not just Shock) is still open for phase 3.
+  per-request client~~ — this need never materialized: per decision 1 below,
+  `/view`'s workspace/object/permission resolution was ported to Go against
+  Mongo directly (new `internal/wsresolve` + `dlstore` collections), not via
+  a JSONRPC call to the Perl RPC service, so no per-request `workspace.Client`
+  is involved on this path at all. `ShockOpenRange` (Shock reads themselves)
+  remains a free function taking the token as a parameter, as already noted
+  above.
 
-### Token validation algorithm for phase 3
+### Token validation (phase 3, done)
 
-Port `P3TokenValidator::validate`
-(`/Users/olson/P3/dev-slurm/modules/p3_auth/lib/P3TokenValidator.pm:26`): take
-everything before `|sig=` as signed data; parse `|`-separated `k=v`; reject if
-`time >= expiry`; reject unless `SigningSubject` is in the trusted list; fetch the
+`internal/p3auth.Validator` ports `P3TokenValidator::validate`
+(`/home/olson/P3/dev-ubuntu/modules/p3_auth/lib/P3TokenValidator.pm:26`): take
+everything before the **last** `|sig=` as signed data; parse `|`-separated
+`k=v`; reject if `time >= expiry` (a missing/unparseable expiry fails closed,
+matching Perl); reject unless `SigningSubject` is in the trusted list; fetch the
 signer URL (JSON `{valid, pubkey}`); RSA-verify the hex-decoded `sig` over the
 signed data using **SHA-1** (`rsa.VerifyPKCS1v15` + `crypto.SHA1`); cache pubkeys
-86400s. SHA-1 is required for compatibility — note it, do not "upgrade" it.
+86400s process-wide (Perl constructs a validator per request, so its own cache
+never hits — this is a latency win, not a behavior change). SHA-1 is required
+for compatibility — note it, do not "upgrade" it. `ParseUnverified` exposes just
+the `un=` claim for `/view`, which only needs the user id off an
+already-session-authenticated token; it performs no verification and must never
+authenticate an inbound request.
 
-Trusted signers (`P3AuthConstants.pm`):
+Trusted signers are **five**, not four (`P3AuthConstants.pm`):
 `https://rast.nmpdr.org/goauth/keys`, `https://user.alpha.patricbrc.org/public_key`,
+`https://user.beta.patricbrc.org/public_key`,
 `https://nexus.api.globusonline.org/goauth/keys`, `https://user.patricbrc.org/public_key`.
+The beta signer is easy to miss — it was omitted from an earlier draft of this
+doc and of `PORT_PLAN.md`, which would have rejected every beta-environment
+token.
 
 ---
 
